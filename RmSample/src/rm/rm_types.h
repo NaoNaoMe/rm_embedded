@@ -58,7 +58,34 @@ typedef uint16_t rm_addr_t;
 /* TX frame buffer: payload + 1-byte OpCode + 1-byte CRC. */
 #define RM_TX_BUF_SIZE          (RM_TX_PAYLOAD_SIZE + 2u)
 
-/* RX frame buffer: sized for the largest inbound command frame. */
+/*
+ * RX frame buffer: sized for the largest inbound frame this build must accept.
+ *
+ * Hand-tuned on purpose.  RmComm cannot derive this value: a derived-frame
+ * extension registers itself at run time through rm_comm_register_derived(),
+ * long after this buffer has been laid out, and rm deliberately knows nothing
+ * about any concrete extension.
+ *
+ * How to size it:
+ *
+ *   - The SLIP decoder tests `len >= RM_RX_BUF_SIZE` *before* storing a byte,
+ *     so the largest frame it can ever complete is RM_RX_BUF_SIZE - 1.  A frame
+ *     one byte longer is discarded inside the decoder: the handler is never
+ *     called and the host sees nothing but a timeout.
+ *
+ *   - rm's own instruction frames need 6 bytes at most (ReadDump / ReadInfo),
+ *     so on a plain rm build 32u is ample.
+ *
+ *   - Derived frames are what actually drives this number.  They arrive as
+ *         [ marker(1) | modeCode(1) | derived frame ]
+ *     so an extension that wants F-byte frames needs
+ *         RM_RX_BUF_SIZE >= F + 3
+ *
+ * Raise this when registering an extension that asks for more than the current
+ * value covers; when it already fits, nothing needs to change here.
+ *
+ */
+
 #define RM_RX_BUF_SIZE          32u
 
 /* ===========================================================================

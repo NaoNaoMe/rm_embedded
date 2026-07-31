@@ -54,6 +54,10 @@ extern "C" {
  * Circular buffer sizes (must be powers of two)
  * ===========================================================================
  */
+/* rx_raw is drained completely by every rm_comm_run(), so it must hold one
+ * tick's arrivals: baud <= (RM_CIRC_RX_SIZE - 1) * 10000 / tick_ms.  16u with
+ * a 5 ms tick caps baud at 30000 -- beyond that push_rx_byte() drops silently
+ * and the host only sees timeouts.  (Uno: 19200 ok, 38400 not.) */
 #define RM_CIRC_RX_SIZE         16u    /* raw bytes from the transport ISR      */
 #define RM_CIRC_SCE_RX_SIZE     32u    /* decoded SCE payload bytes (→ app)     */
 #define RM_CIRC_SCE_TX_SIZE    128u    /* SCE bytes queued by the app (→ wire)  */
@@ -64,6 +68,59 @@ extern "C" {
  */
 #define RM_DERIVED_MARKER       0x00u   /* first byte of every derived frame    */
 #define RM_DERIVED_SCE          0x01u   /* modeCode: SerialCommunicationEmulation */
+
+/* ===========================================================================
+ * Derived-frame extension interface
+ *
+ * RmComm handles the SCE derived channel internally.  Every other derived
+ * frame (marker present, modeCode != SCE, or SCE while not yet approved) is
+ * delegated to an optional, externally registered extension handler.  RmComm
+ * itself has no knowledge of any concrete extension; the extension registers
+ * itself via rm_comm_register_derived(), inverting the dependency.
+ *
+ * Frame data passed to/produced by the handler is the derived frame minus the
+ * leading marker byte, i.e. [ modeCode | payload... ].
+ *
+ * Each registered extension is a single, static instance (this system does not
+ * permit multiple instances of a derived handler), so the callbacks carry no
+ * per-instance context pointer.  Any callback may be NULL; RmComm treats a NULL
+ * callback (or a NULL handler) as "no data".
+ * ===========================================================================
+ */
+typedef struct {
+    /**
+     * on_rx — deliver one inbound derived frame to the extension.
+     * @param data Frame bytes without the marker: [modeCode, payload...].
+     * @param len  Number of valid bytes in data.
+     * @return true if the extension accepted the frame (informational).
+     */
+    bool (*on_rx)(const uint8_t *data, uint16_t len);
+
+    /**
+     * tx_available — number of derived bytes the extension wants to send now.
+     * @return Byte count waiting (0 if nothing to send).
+     */
+    uint16_t (*tx_available)(void);
+
+    /**
+     * tx_get — copy pending derived bytes into the supplied buffer.
+     * @param buf      Destination (RmComm writes after the marker byte).
+     * @param max_len  Capacity of buf.
+     * @return Number of bytes actually written.
+     */
+    uint16_t (*tx_get)(uint8_t *buf, uint16_t max_len);
+} rm_derived_handler_t;
+
+/**
+ * rm_comm_register_derived — install (or remove) the derived-frame extension.
+ *
+ * Pass a pointer to a handler with static storage duration; RmComm retains the
+ * pointer, not a copy.  Pass NULL to detach.  May be called before or after
+ * rm_comm_init().
+ *
+ * @param handler  Extension handler, or NULL to detach.
+ */
+void rm_comm_register_derived(const rm_derived_handler_t *handler);
 
 /* ===========================================================================
  * Core driver API
@@ -89,7 +146,7 @@ void rm_comm_init(uint8_t  *ver,
  * rm_comm_run — main processing tick; call once per ms interval.
  *
  * Processing order:
- *   0. SLIP inter-byte timeout.
+ *   0. SLIP inter-byte timeout watchdog.
  *   1. Drain raw RX circular buffer through the SLIP decoder.
  *   2. Route completed derived frames to the SCE RX buffer (if approved).
  *   3. Call rm_core_tick to advance the protocol state machine.

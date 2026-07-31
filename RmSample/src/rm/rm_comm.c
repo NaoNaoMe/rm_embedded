@@ -83,9 +83,17 @@ typedef struct {
     rm_circ_t     rx_raw;
     rm_circ_t     rx_sce;
     rm_circ_t     tx_sce;
+
+    /* Optional externally registered derived-frame extension. */
+    const rm_derived_handler_t *derived;
 } rm_comm_t;
 
 static rm_comm_t rm_ctx;
+
+void rm_comm_register_derived(const rm_derived_handler_t *handler)
+{
+    rm_ctx.derived = handler;
+}
 
 /* Backing arrays for circular buffers. */
 static uint8_t rm_rx_raw_buf[RM_CIRC_RX_SIZE];
@@ -389,6 +397,17 @@ void rm_comm_run(void)
                 circ_enqueue(&rm_ctx.rx_sce, rm_ctx.rx_frame.buf[i]);
             }
         }
+        else
+        {
+            /* Delegate every other derived frame to the registered extension.
+             * Data is the frame minus the marker: [modeCode, payload...]. */
+            if (rm_ctx.derived != NULL && rm_ctx.derived->on_rx != NULL)
+            {
+                (void)rm_ctx.derived->on_rx(&rm_ctx.rx_frame.buf[1],
+                                            (uint16_t)(rm_ctx.rx_frame.len - 1u));
+            }
+        }
+
         rm_ctx.rx_frame.complete = false;
         rm_ctx.rx_frame.len      = 0u;
     }
@@ -397,10 +416,10 @@ void rm_comm_run(void)
     rm_core_tick(&rm_ctx.proto, &rm_ctx.rx_frame, &rm_ctx.tx_frame);
 
     /* --- 4. TX arbiter: SCE fills idle time ------------------------------- */
-    if (!rm_ctx.tx_frame.ready && rm_ctx.proto.is_approved)
+    if (!rm_ctx.tx_frame.ready)
     {
         count = circ_available(&rm_ctx.tx_sce);
-        if (count > 0u)
+        if(count > 0u && rm_ctx.proto.is_approved)
         {
             /* Clamp to available payload space (buf size minus 2-byte header). */
             if (count > (uint16_t)(RM_TX_BUF_SIZE - 2u))
@@ -419,6 +438,20 @@ void rm_comm_run(void)
             rm_ctx.tx_frame.len   = 2u + count;
             rm_ctx.tx_frame.ready = true;
         }
+        else if (rm_ctx.derived != NULL && rm_ctx.derived->tx_available != NULL)
+        {
+            count = rm_ctx.derived->tx_available();
+            if(count > 0u)
+            {
+                rm_ctx.tx_frame.buf[0] = RM_DERIVED_MARKER;
+                count = rm_ctx.derived->tx_get(&rm_ctx.tx_frame.buf[1],
+                                               (uint16_t)(RM_TX_BUF_SIZE - 1u));
+                rm_ctx.tx_frame.len   = 1u + count;
+                rm_ctx.tx_frame.ready = true;
+            }
+        }
+
+
     }
 }
 
